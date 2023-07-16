@@ -20,7 +20,7 @@ import os
 import warnings
 from contextlib import contextmanager
 from copy import deepcopy
-from typing import Any, Dict, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 from accelerate import dispatch_model, infer_auto_device_map
@@ -53,6 +53,7 @@ from .utils import (
     PeftType,
     PromptLearningConfig,
     TaskType,
+    _prepare_prompt_learning_config,
     _set_adapter,
     _set_trainable,
     add_library_to_model_card,
@@ -118,7 +119,13 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         if getattr(model, "is_gradient_checkpointing", True):
             model = self._prepare_model_for_gradient_checkpointing(model)
 
-    def save_pretrained(self, save_directory: str, safe_serialization: bool = False, **kwargs: Any):
+    def save_pretrained(
+        self,
+        save_directory: str,
+        safe_serialization: bool = False,
+        selected_adapters: Optional[List[str]] = None,
+        **kwargs: Any,
+    ):
         r"""
         This function saves the adapter model and the adapter configuration files to a directory, so that it can be
         reloaded using the [`LoraModel.from_pretrained`] class method, and also used by the [`LoraModel.push_to_hub`]
@@ -133,10 +140,24 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         """
         if os.path.isfile(save_directory):
             raise ValueError(f"Provided path ({save_directory}) should be a directory, not a file")
+
+        if selected_adapters is None:
+            selected_adapters = list(self.peft_config.keys())
+        else:
+            if any(
+                selected_adapter_name not in list(self.peft_config.keys())
+                for selected_adapter_name in selected_adapters
+            ):
+                raise ValueError(
+                    f"You passed an invalid `selected_adapters` arguments, current supported adapter names are"
+                    f" {list(self.peft_config.keys())} - got {selected_adapters}."
+                )
+
         os.makedirs(save_directory, exist_ok=True)
         self.create_or_update_model_card(save_directory)
 
-        for adapter_name, peft_config in self.peft_config.items():
+        for adapter_name in selected_adapters:
+            peft_config = self.peft_config[adapter_name]
             # save only the trainable weights
             output_state_dict = get_peft_model_state_dict(
                 self, state_dict=kwargs.get("state_dict", None), adapter_name=adapter_name
@@ -146,7 +167,9 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
 
             if safe_serialization:
                 safe_save_file(
-                    output_state_dict, os.path.join(output_dir, SAFETENSORS_WEIGHTS_NAME), metadata={"format": "pt"}
+                    output_state_dict,
+                    os.path.join(output_dir, SAFETENSORS_WEIGHTS_NAME),
+                    metadata={"format": "pt"},
                 )
             else:
                 torch.save(output_state_dict, os.path.join(output_dir, WEIGHTS_NAME))
@@ -160,7 +183,22 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
                 )
             inference_mode = peft_config.inference_mode
             peft_config.inference_mode = True
-            peft_config.save_pretrained(output_dir)
+
+            if peft_config.task_type is None:
+                # deal with auto mapping
+                base_model_class = self._get_base_model_class(
+                    is_prompt_tuning=isinstance(peft_config, PromptLearningConfig)
+                )
+                parent_library = base_model_class.__module__
+
+                auto_mapping_dict = {
+                    "base_model_class": base_model_class.__name__,
+                    "parent_library": parent_library,
+                }
+            else:
+                auto_mapping_dict = None
+
+            peft_config.save_pretrained(output_dir, auto_mapping_dict=auto_mapping_dict)
             peft_config.inference_mode = inference_mode
 
     @classmethod
@@ -234,8 +272,9 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
 
     def _setup_prompt_encoder(self, adapter_name: str):
         config = self.peft_config[adapter_name]
-        self.prompt_encoder = torch.nn.ModuleDict({})
-        self.prompt_tokens = {}
+        if not hasattr(self, "prompt_encoder"):
+            self.prompt_encoder = torch.nn.ModuleDict({})
+            self.prompt_tokens = {}
         transformer_backbone = None
         for name, module in self.base_model.named_children():
             for param in module.parameters():
@@ -264,6 +303,8 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             prompt_encoder = PrefixEncoder(config)
         else:
             raise ValueError("Not supported")
+
+        prompt_encoder = prompt_encoder.to(self.device)
         self.prompt_encoder.update(torch.nn.ModuleDict({adapter_name: prompt_encoder}))
         self.prompt_tokens[adapter_name] = torch.arange(
             config.num_virtual_tokens * config.num_transformer_submodules
@@ -373,6 +414,14 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         """
         return self.get_base_model()(*args, **kwargs)
 
+    def _get_base_model_class(self, is_prompt_tuning=False):
+        """
+        Returns the base model class.
+        """
+        if not is_prompt_tuning:
+            return self.base_model.model.__class__
+        return self.base_model.__class__
+
     @contextmanager
     def disable_adapter(self):
         """
@@ -380,14 +429,19 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
         """
         try:
             if isinstance(self.peft_config[self.active_adapter], PromptLearningConfig):
+                # TODO: consider replacing this patching of methods with a more robust mechanism: setting a flag and
+                # letting the underyling methods deal with it, same as how LoRA does it.
                 old_forward = self.forward
                 self.forward = self.base_model.forward
+                old_prepare_inputs_for_generation = self.prepare_inputs_for_generation
+                self.prepare_inputs_for_generation = self.base_model.prepare_inputs_for_generation
             else:
                 self.base_model.disable_adapter_layers()
             yield
         finally:
             if isinstance(self.peft_config[self.active_adapter], PromptLearningConfig):
                 self.forward = old_forward
+                self.old_prepare_inputs_for_generation = old_prepare_inputs_for_generation
             else:
                 self.base_model.enable_adapter_layers()
 
@@ -405,6 +459,12 @@ class PeftModel(PushToHubMixin, torch.nn.Module):
             )
         self.peft_config[adapter_name] = peft_config
         if isinstance(peft_config, PromptLearningConfig):
+            if hasattr(self.config, "to_dict"):
+                dict_config = self.config.to_dict()
+            else:
+                dict_config = self.config
+
+            peft_config = _prepare_prompt_learning_config(peft_config, dict_config)
             self._setup_prompt_encoder(adapter_name)
         else:
             self.base_model.add_adapter(adapter_name, peft_config)
@@ -1061,7 +1121,11 @@ class PeftModelForSeq2SeqLM(PeftModel):
         if peft_config.peft_type == PeftType.PREFIX_TUNING:
             past_key_values = self.get_prompt(batch_size)
             return self.base_model(
-                input_ids=input_ids, decoder_input_ids=decoder_input_ids, past_key_values=past_key_values, **kwargs
+                input_ids=input_ids,
+                decoder_input_ids=decoder_input_ids,
+                decoder_inputs_embeds=decoder_inputs_embeds,
+                past_key_values=past_key_values,
+                **kwargs,
             )
         elif peft_config.peft_type in [PeftType.PROMPT_TUNING, PeftType.P_TUNING]:
             if inputs_embeds is None:
@@ -1078,7 +1142,12 @@ class PeftModelForSeq2SeqLM(PeftModel):
             prompts = prompts.to(inputs_embeds.dtype)
             inputs_embeds = torch.cat((prompts[:, : peft_config.num_virtual_tokens], inputs_embeds), dim=1)
 
-            return self.base_model(inputs_embeds=inputs_embeds, **kwargs)
+            return self.base_model(
+                inputs_embeds=inputs_embeds,
+                decoder_input_ids=decoder_input_ids,
+                decoder_inputs_embeds=decoder_inputs_embeds,
+                **kwargs,
+            )
         else:
             if inputs_embeds is None:
                 inputs_embeds = self.word_embeddings(input_ids)
