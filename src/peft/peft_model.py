@@ -1374,55 +1374,7 @@ class PeftModelForSeq2SeqLM(PeftModel):
             self._prepare_encoder_decoder_kwargs_for_generation
         )
         try:
-            if not peft_config.is_prompt_learning:
-                outputs = self.base_model.generate(**kwargs)
-            else:
-                if "input_ids" not in kwargs:
-                    raise ValueError("input_ids must be provided for Peft model generation")
-                if kwargs.get("position_ids", None) is not None:
-                    warnings.warn(
-                        "Position ids are not supported for parameter efficient tuning. Ignoring position ids."
-                    )
-                    kwargs["position_ids"] = None
-                if kwargs.get("token_type_ids", None) is not None:
-                    warnings.warn(
-                        "Token type ids are not supported for parameter efficient tuning. Ignoring token type ids"
-                    )
-                    kwargs["token_type_ids"] = None
-
-                if peft_config.peft_type == PeftType.PREFIX_TUNING:
-                    outputs = self.base_model.generate(**kwargs)
-                elif peft_config.peft_type in [
-                    PeftType.PROMPT_TUNING,
-                    PeftType.P_TUNING,
-                    PeftType.MULTITASK_PROMPT_TUNING,
-                ]:
-                    kwargs = deepcopy(kwargs)
-
-                    if "encoder_outputs" in kwargs:
-                        del kwargs["encoder_ouputs"]
-                        warnings.warn(
-                            "`encoder_outputs` should not be passed to `generate` when using prompt tuning. Ignoring it."
-                        )
-
-                    input_ids = kwargs.pop("input_ids")
-                    inputs_embeds = self.word_embeddings(input_ids)
-                    batch_size = inputs_embeds.shape[0]
-                    prompts = self.get_prompt(batch_size=batch_size, task_ids=kwargs.pop("task_ids", None))
-                    prompts = prompts.to(inputs_embeds.dtype)
-
-                    inputs_embeds = torch.cat((prompts[:, : peft_config.num_virtual_tokens], inputs_embeds), dim=1)
-                    kwargs["inputs_embeds"] = inputs_embeds
-
-                    if "attention_mask" in kwargs:
-                        prefix_attention_mask = torch.ones(batch_size, peft_config.num_virtual_tokens).to(
-                            kwargs["attention_mask"].device
-                        )
-                        kwargs["attention_mask"] = torch.cat((prefix_attention_mask, kwargs["attention_mask"]), dim=1)
-
-                    return self.base_model.generate(**kwargs)
-                else:
-                    raise NotImplementedError
+            outputs = self.base_model.generate(**kwargs)
         except:
             self.base_model.prepare_inputs_for_generation = self.base_model_prepare_inputs_for_generation
             self.base_model._prepare_encoder_decoder_kwargs_for_generation = (
@@ -1441,10 +1393,47 @@ class PeftModelForSeq2SeqLM(PeftModel):
         model_kwargs = self.base_model_prepare_inputs_for_generation(*args, **kwargs)
         if peft_config.peft_type == PeftType.POLY:
             model_kwargs["task_ids"] = task_ids
-        if model_kwargs["past_key_values"] is None and peft_config.peft_type == PeftType.PREFIX_TUNING:
-            batch_size = model_kwargs["decoder_input_ids"].shape[0]
-            past_key_values = self.get_prompt(batch_size)
-            model_kwargs["past_key_values"] = past_key_values
+
+        if peft_config.is_prompt_learning:
+            if "input_ids" not in model_kwargs:
+                raise ValueError("input_ids must be provided for Peft model generation")
+            if model_kwargs.get("position_ids", None) is not None:
+                warnings.warn(
+                    "Position ids are not supported for parameter efficient tuning. Ignoring position ids."
+                )
+                model_kwargs["position_ids"] = None
+            if model_kwargs.get("token_type_ids", None) is not None:
+                warnings.warn(
+                    "Token type ids are not supported for parameter efficient tuning. Ignoring token type ids"
+                )
+                model_kwargs["token_type_ids"] = None
+
+            if peft_config.peft_type == PeftType.PREFIX_TUNING:
+                if model_kwargs["past_key_values"] is None:
+                    batch_size = model_kwargs["decoder_input_ids"].shape[0]
+                    past_key_values = self.get_prompt(batch_size)
+                    model_kwargs["past_key_values"] = past_key_values
+            else:
+                if "encoder_outputs" in model_kwargs:
+                    model_kwargs["encoder_ouputs"] = None
+                    warnings.warn(
+                        "`encoder_outputs` should not be passed to `generate` when using prompt tuning. Ignoring it."
+                    )
+
+                inputs_embeds = self.word_embeddings(model_kwargs["input_ids"])
+                batch_size = inputs_embeds.shape[0]
+                prompts = self.get_prompt(batch_size=batch_size, task_ids=task_ids)
+                prompts = prompts.to(inputs_embeds.dtype)
+
+                inputs_embeds = torch.cat((prompts[:, : peft_config.num_virtual_tokens], inputs_embeds), dim=1)
+                model_kwargs["inputs_embeds"] = inputs_embeds
+                model_kwargs["input_ids"] = None
+
+                if "attention_mask" in model_kwargs:
+                    prefix_attention_mask = torch.ones(batch_size, peft_config.num_virtual_tokens).to(
+                        model_kwargs["attention_mask"].device
+                    )
+                    model_kwargs["attention_mask"] = torch.cat((prefix_attention_mask, model_kwargs["attention_mask"]), dim=1)
 
         return model_kwargs
 
